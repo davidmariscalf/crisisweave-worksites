@@ -17,7 +17,8 @@ This repository owns the recovery-work contract and lifecycle. It is deliberatel
 - explicit privacy-minimised public export
 - privacy-preserving Crisis Cleanup JSON adapter
 - small localhost HTTP API for the field UI
-- optional coordinator token for write endpoints
+- bounded production HTTP runtime with connection timeouts
+- coordinator token protection for all operational reads/writes in the Docker runtime
 - exact-origin CORS when browser access is explicitly enabled
 - synthetic demo data with no survivor PII
 - unit tests and GitHub Actions
@@ -86,15 +87,13 @@ The adapter:
 
 It is an import transformer, **not** an authenticated Crisis Cleanup API client. A live integration still requires an approved API contract and credentials from Crisis Cleanup.
 
-### HTTP writes
+### HTTP authentication boundary
 
-For a local demo, the server binds to `127.0.0.1` and can accept writes without a token. To require one:
+`worksites.py serve` remains a localhost-oriented development/demo server. In that mode `CW_COORDINATOR_TOKEN` protects writes, while local reads remain convenient for synthetic development.
 
-```bash
-CW_COORDINATOR_TOKEN='replace-me' python worksites.py --db demo.db serve
-```
+The Docker image and production stack run `worksites_server.py` instead. When `CW_COORDINATOR_TOKEN` is configured there, **all operational reads and writes require the bearer token**. Only `GET /api/health` stays unauthenticated for container/orchestrator probes. The service is also kept on a private Docker network and is not intended to be exposed directly to the Internet.
 
-Then send `Authorization: Bearer replace-me` on POST requests. This is a demo protection mechanism, not production identity/authentication. CORS is disabled unless an exact `CW_WORKSITES_ALLOWED_ORIGIN` is configured.
+The token is an internal service credential, not end-user identity. Browser/users authenticate at `crisisweave-platform`; the platform then talks to worksites over the private network. CORS is disabled unless an exact `CW_WORKSITES_ALLOWED_ORIGIN` is explicitly configured.
 
 ## API
 
