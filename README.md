@@ -24,10 +24,10 @@ This repository owns the recovery-work contract and lifecycle. It is deliberatel
 Requires Python 3.10+ and no third-party packages.
 
 ```bash
-python worksites.py init --db demo.db
-python worksites.py import examples/worksites.jsonl --db demo.db
-python worksites.py list --db demo.db
-python worksites.py serve --db demo.db --port 8787
+python worksites.py --db demo.db init
+python worksites.py --db demo.db import examples/worksites.jsonl
+python worksites.py --db demo.db list
+python worksites.py --db demo.db serve --port 8787
 ```
 
 API: `http://127.0.0.1:8787/api/worksites`.
@@ -45,7 +45,7 @@ requested -> triaged -> ready -> assigned -> in_progress -> completed
 ### Atomic assignment
 
 ```bash
-python worksites.py assign cw-work-001 --team team-alpha --actor coordinator-1 --db demo.db
+python worksites.py --db demo.db assign cw-work-001 --team team-alpha --actor coordinator-1
 ```
 
 SQLite `BEGIN IMMEDIATE` is used around assignment. A second assignment attempt fails instead of silently overwriting the first team.
@@ -55,7 +55,7 @@ SQLite `BEGIN IMMEDIATE` is used around assignment. A second assignment attempt 
 For a local demo, the server binds to `127.0.0.1` and can accept writes without a token. To require one:
 
 ```bash
-CW_COORDINATOR_TOKEN='replace-me' python worksites.py serve --db demo.db
+CW_COORDINATOR_TOKEN='replace-me' python worksites.py --db demo.db serve
 ```
 
 Then send `Authorization: Bearer replace-me` on POST requests. This is a demo protection mechanism, not production identity/authentication.
