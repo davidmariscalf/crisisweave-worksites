@@ -24,16 +24,7 @@ jobs:
             crisisweave-worksites:test
           trap 'docker stop cw-worksites-test >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 30); do
-            if python - <<'PY'
-import json, urllib.request
-try:
-    with urllib.request.urlopen('http://127.0.0.1:18787/api/health', timeout=2) as response:
-        data = json.load(response)
-        raise SystemExit(0 if response.status == 200 and data.get('ok') else 1)
-except Exception:
-    raise SystemExit(1)
-PY
-            then
+            if python -c "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:18787/api/health',timeout=2); d=json.load(r); assert r.status==200 and d.get('ok')"; then
               exit 0
             fi
             sleep 1
