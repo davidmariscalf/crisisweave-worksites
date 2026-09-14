@@ -66,7 +66,6 @@ def validate_worksite(w: dict[str, Any]) -> None:
     missing = [k for k in required if k not in w]
     if missing:
         raise ValueError("missing required fields: " + ", ".join(missing))
-
     safe_id(w["id"], "worksite id")
     safe_text(w["title"], "title", 300)
     if w["work_type"] not in WORK_TYPES:
@@ -77,14 +76,12 @@ def validate_worksite(w: dict[str, Any]) -> None:
         raise ValueError("unsupported priority")
     if not isinstance(w["people_needed"], int) or isinstance(w["people_needed"], bool) or not 1 <= w["people_needed"] <= 1000:
         raise ValueError("people_needed must be an integer from 1 to 1000")
-
     for field in ("skills", "hazards"):
         if not isinstance(w[field], list) or len(w[field]) > 100 or not all(isinstance(x, str) for x in w[field]):
             raise ValueError(f"{field} must be a list of at most 100 strings")
         normalized = [safe_text(x, f"{field} item", 120) for x in w[field]]
         if len(set(normalized)) != len(normalized):
             raise ValueError(f"{field} must not contain duplicates")
-
     safe_text(w["area"], "area", 300)
     geometry = w["geometry"]
     if not isinstance(geometry, dict) or geometry.get("type") != "Point":
@@ -98,18 +95,15 @@ def validate_worksite(w: dict[str, Any]) -> None:
         raise ValueError("coordinates must be numeric") from None
     if not (-180 <= lon <= 180 and -90 <= lat <= 90):
         raise ValueError("coordinates outside valid bounds")
-
     source = w["source"]
     if not isinstance(source, dict) or source.get("type") not in {"request", "assessment", "partner_import", "synthetic"}:
         raise ValueError("source must represent an explicit request, assessment, partner import or synthetic demo")
     safe_text(source.get("name"), "source.name", 200)
     safe_text(source.get("source_id"), "source.source_id", 200)
-
     if w["state"] == "assigned":
         safe_id(w.get("assigned_team"), "assigned_team")
     elif w.get("assigned_team") not in (None, ""):
         raise ValueError("assigned_team is only valid in assigned state")
-
     if "coordinator_instructions" in w:
         safe_text(w.get("coordinator_instructions"), "coordinator_instructions", 2000, required=False)
 
@@ -159,10 +153,7 @@ class WorksiteStore:
     @staticmethod
     def _decode(row: sqlite3.Row) -> dict[str, Any]:
         data = json.loads(row["payload"])
-        data.update(
-            state=row["state"], assigned_team=row["assigned_team"], version=row["version"],
-            created_at=row["created_at"], updated_at=row["updated_at"],
-        )
+        data.update(state=row["state"], assigned_team=row["assigned_team"], version=row["version"], created_at=row["created_at"], updated_at=row["updated_at"])
         return data
 
     def _audit(self, con, wid, actor, action, old_state, new_state, note="", details=None):
@@ -191,6 +182,8 @@ class WorksiteStore:
             if prev:
                 old_state = prev["state"]
                 locked = old_state in LOCKED_IMPORT_STATES
+                if not locked and incoming["state"] == "assigned":
+                    raise ValueError("use assign operation to enter assigned state")
                 state = old_state if locked else incoming["state"]
                 assigned_team = prev["assigned_team"] if locked else incoming.get("assigned_team")
                 con.execute(
@@ -244,10 +237,7 @@ class WorksiteStore:
             if target not in TRANSITIONS[current]:
                 raise ValueError(f"invalid transition: {current} -> {target}")
             assigned_team = None if target in {"completed", "cancelled"} else row["assigned_team"]
-            con.execute(
-                "UPDATE worksites SET state=?,assigned_team=?,version=version+1,updated_at=? WHERE id=?",
-                (target, assigned_team, now(), wid),
-            )
+            con.execute("UPDATE worksites SET state=?,assigned_team=?,version=version+1,updated_at=? WHERE id=?", (target, assigned_team, now(), wid))
             self._audit(con, wid, actor, "transition", current, target, note)
         return self.get(wid)
 
@@ -264,10 +254,7 @@ class WorksiteStore:
                 if row["state"] in {"assigned", "in_progress"}:
                     raise ValueError(f"worksite already allocated to {row['assigned_team'] or 'another team'}")
                 raise ValueError(f"worksite must be ready before assignment; current state is {row['state']}")
-            con.execute(
-                "UPDATE worksites SET state='assigned',assigned_team=?,version=version+1,updated_at=? WHERE id=?",
-                (team_id, now(), wid),
-            )
+            con.execute("UPDATE worksites SET state='assigned',assigned_team=?,version=version+1,updated_at=? WHERE id=?", (team_id, now(), wid))
             self._audit(con, wid, actor, "assigned", "ready", "assigned", details={"team_id": team_id})
         return self.get(wid)
 
@@ -282,10 +269,7 @@ class WorksiteStore:
             if row["state"] != "assigned":
                 raise ValueError("only an assigned worksite can be released")
             team = row["assigned_team"]
-            con.execute(
-                "UPDATE worksites SET state='ready',assigned_team=NULL,version=version+1,updated_at=? WHERE id=?",
-                (now(), wid),
-            )
+            con.execute("UPDATE worksites SET state='ready',assigned_team=NULL,version=version+1,updated_at=? WHERE id=?", (now(), wid))
             self._audit(con, wid, actor, "released", "assigned", "ready", details={"team_id": team})
         return self.get(wid)
 
@@ -350,8 +334,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if not self.token:
             return True
         supplied = self.headers.get("Authorization", "")
-        expected = f"Bearer {self.token}"
-        return hmac.compare_digest(supplied, expected)
+        return hmac.compare_digest(supplied, f"Bearer {self.token}")
 
     def _body(self) -> dict[str, Any]:
         try:
@@ -404,7 +387,9 @@ class APIHandler(BaseHTTPRequestHandler):
             return self._json(200, out)
         except KeyError:
             return self._json(404, {"error": "worksite not found"})
-        except (ValueError, json.JSONDecodeError) as exc:
+        except json.JSONDecodeError:
+            return self._json(400, {"error": "invalid JSON"})
+        except ValueError as exc:
             return self._json(409, {"error": str(exc)})
 
 
@@ -471,11 +456,7 @@ def main() -> None:
         for worksite in store.list(args.state):
             print(json.dumps(worksite, ensure_ascii=False))
     elif args.cmd == "serve":
-        server = build_server(
-            store, args.host, args.port,
-            os.getenv("CW_COORDINATOR_TOKEN") or None,
-            args.allowed_origin,
-        )
+        server = build_server(store, args.host, args.port, os.getenv("CW_COORDINATOR_TOKEN") or None, args.allowed_origin)
         print(f"CrisisWeave worksites API on http://{args.host}:{args.port}")
         server.serve_forever()
 
