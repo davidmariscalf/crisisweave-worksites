@@ -12,7 +12,7 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.12'
-      - run: python -m py_compile worksites.py worksites_server.py server_runtime.py public_export.py
+      - run: python -m py_compile worksites.py worksites_server.py server_runtime.py public_export.py audit_guard.py
       - run: python worksites.py --db /tmp/cw.db validate examples/worksites.jsonl
       - run: python -m unittest discover -s tests -v
       - name: Build container
@@ -26,6 +26,7 @@ jobs:
           trap 'docker stop cw-worksites-test >/dev/null 2>&1 || true' EXIT
           for i in $(seq 1 30); do
             if python -c "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:18787/api/health',timeout=2); d=json.load(r); assert r.status==200 and d.get('ok')"; then
+              docker exec cw-worksites-test python audit_guard.py verify >/dev/null
               exit 0
             fi
             sleep 1
