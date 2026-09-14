@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import json
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -28,6 +29,9 @@ MAX_REQUEST_BYTES = 100_000
 MAX_NOTE_LENGTH = 1000
 MAX_ID_LENGTH = 128
 MAX_TEXT_LENGTH = 500
+MAX_JSONL_BYTES = 64 * 1024 * 1024
+MAX_JSONL_RECORDS = 100_000
+MAX_JSONL_LINE_CHARS = 2 * 1024 * 1024
 
 
 def now() -> str:
@@ -58,6 +62,8 @@ def parse_origin(value: str | None) -> str | None:
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
         raise ValueError("allowed origin must be an exact http(s) origin")
+    if parsed.username or parsed.password:
+        raise ValueError("allowed origin must not contain credentials")
     return value
 
 
@@ -93,6 +99,8 @@ def validate_worksite(w: dict[str, Any]) -> None:
         lon, lat = float(coordinates[0]), float(coordinates[1])
     except (TypeError, ValueError):
         raise ValueError("coordinates must be numeric") from None
+    if not math.isfinite(lon) or not math.isfinite(lat):
+        raise ValueError("coordinates must be finite")
     if not (-180 <= lon <= 180 and -90 <= lat <= 90):
         raise ValueError("coordinates outside valid bounds")
     source = w["source"]
@@ -284,7 +292,7 @@ class APIHandler(BaseHTTPRequestHandler):
     store: WorksiteStore
     token: str | None = None
     allowed_origin: str | None = None
-    server_version = "CrisisWeaveWorksites/0.2"
+    server_version = "CrisisWeaveWorksites/0.3"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -295,7 +303,7 @@ class APIHandler(BaseHTTPRequestHandler):
         return origin if self.allowed_origin and origin == self.allowed_origin else None
 
     def _json(self, status: int, data: Any) -> None:
-        body = b"" if status == 204 else json.dumps(data, ensure_ascii=False).encode()
+        body = b"" if status == 204 else json.dumps(data, ensure_ascii=False, allow_nan=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -307,6 +315,8 @@ class APIHandler(BaseHTTPRequestHandler):
         if cors:
             self.send_header("Access-Control-Allow-Origin", cors)
             self.send_header("Vary", "Origin")
+        for key, value in (("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),):
+            self.send_header(key, value)
         self.end_headers()
         if body:
             self.wfile.write(body)
@@ -352,7 +362,9 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             parts = self._parts()
             if parts == ["api", "health"]:
-                return self._json(200, {"ok": True, "service": "crisisweave-worksites", "version": "0.2"})
+                return self._json(200, {"ok": True, "service": "crisisweave-worksites", "version": "0.3"})
+            if not self._auth():
+                return self._json(401, {"error": "unauthorised"})
             if parts == ["api", "worksites"]:
                 return self._json(200, {"worksites": self.store.list()})
             if len(parts) == 3 and parts[:2] == ["api", "worksites"]:
@@ -402,15 +414,23 @@ def build_server(store: WorksiteStore, host="127.0.0.1", port=8787, token=None, 
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
-    with Path(path).open(encoding="utf-8") as handle:
-        rows = []
-        for line in handle:
-            if line.strip():
-                value = json.loads(line)
-                if not isinstance(value, dict):
-                    raise ValueError("JSONL rows must be objects")
-                rows.append(value)
-        return rows
+    path = Path(path)
+    if path.stat().st_size > MAX_JSONL_BYTES:
+        raise ValueError(f"JSONL file exceeds {MAX_JSONL_BYTES} bytes")
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8") as handle:
+        for number, line in enumerate(handle, 1):
+            if len(line) > MAX_JSONL_LINE_CHARS:
+                raise ValueError(f"line {number} exceeds {MAX_JSONL_LINE_CHARS} characters")
+            if not line.strip():
+                continue
+            if len(rows) >= MAX_JSONL_RECORDS:
+                raise ValueError(f"JSONL file exceeds {MAX_JSONL_RECORDS} records")
+            value = json.loads(line)
+            if not isinstance(value, dict):
+                raise ValueError(f"line {number} must contain a JSON object")
+            rows.append(value)
+    return rows
 
 
 def main() -> None:
@@ -445,16 +465,16 @@ def main() -> None:
             store.upsert(row)
         print(json.dumps({"imported": len(rows)}))
     elif args.cmd == "list":
-        print(json.dumps(store.list(args.state), ensure_ascii=False, indent=2))
+        print(json.dumps(store.list(args.state), ensure_ascii=False, indent=2, allow_nan=False))
     elif args.cmd == "assign":
-        print(json.dumps(store.assign(args.id, args.team, args.actor), ensure_ascii=False, indent=2))
+        print(json.dumps(store.assign(args.id, args.team, args.actor), ensure_ascii=False, indent=2, allow_nan=False))
     elif args.cmd == "transition":
-        print(json.dumps(store.transition(args.id, args.state, args.actor, args.note), ensure_ascii=False, indent=2))
+        print(json.dumps(store.transition(args.id, args.state, args.actor, args.note), ensure_ascii=False, indent=2, allow_nan=False))
     elif args.cmd == "release":
-        print(json.dumps(store.release(args.id, args.actor), ensure_ascii=False, indent=2))
+        print(json.dumps(store.release(args.id, args.actor), ensure_ascii=False, indent=2, allow_nan=False))
     elif args.cmd == "export":
         for worksite in store.list(args.state):
-            print(json.dumps(worksite, ensure_ascii=False))
+            print(json.dumps(worksite, ensure_ascii=False, allow_nan=False))
     elif args.cmd == "serve":
         server = build_server(store, args.host, args.port, os.getenv("CW_COORDINATOR_TOKEN") or None, args.allowed_origin)
         print(f"CrisisWeave worksites API on http://{args.host}:{args.port}")
