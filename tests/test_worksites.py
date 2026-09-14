@@ -1,4 +1,3 @@
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,10 +30,16 @@ class WorksiteTests(unittest.TestCase):
         self.store.upsert(sample()); self.store.assign("w1","team-a","coord"); self.store.release("w1","coord"); out=self.store.assign("w1","team-b","coord")
         self.assertEqual(out["assigned_team"],"team-b")
     def test_lifecycle(self):
-        w=sample("requested"); self.store.upsert(w); self.store.transition("w1","triaged","coord"); self.store.transition("w1","ready","coord"); self.store.assign("w1","team-a","coord"); self.store.transition("w1","in_progress","lead"); out=self.store.transition("w1","completed","lead")
+        self.store.upsert(sample("requested")); self.store.transition("w1","triaged","coord"); self.store.transition("w1","ready","coord"); self.store.assign("w1","team-a","coord"); self.store.transition("w1","in_progress","lead"); out=self.store.transition("w1","completed","lead")
         self.assertEqual(out["state"],"completed")
     def test_audit_is_append_only_history(self):
         self.store.upsert(sample()); self.store.assign("w1","team-a","coord"); actions=[x["action"] for x in self.store.audit("w1")]
         self.assertEqual(actions,["created","assigned"])
+    def test_reimport_cannot_erase_active_assignment(self):
+        self.store.upsert(sample()); self.store.assign("w1","team-a","coord")
+        incoming=sample("ready"); incoming["title"]="Updated description from partner"
+        out=self.store.upsert(incoming,"sync")
+        self.assertEqual(out["state"],"assigned"); self.assertEqual(out["assigned_team"],"team-a"); self.assertEqual(out["title"],"Updated description from partner")
+        self.assertEqual(self.store.audit("w1")[-1]["action"],"import_refresh_locked")
 
 if __name__=="__main__": unittest.main()
