@@ -8,19 +8,12 @@ from worksites import APIHandler, WorksiteStore, parse_origin
 
 
 class HardenedAPIHandler(APIHandler):
-    """Production runtime boundary for the internal worksite service.
+    """Bounded production runtime using the same auth rules as the base API.
 
-    Health remains unauthenticated so container/orchestrator probes work. When a
-    coordinator token is configured, every operational read and write requires
-    that token; the public browser is expected to go through crisisweave-platform
-    or consume an explicitly redacted public snapshot instead.
+    `APIHandler` keeps `/api/health` public and requires the configured
+    coordinator token for every operational read and write. This subclass exists
+    as an explicit production boundary while sharing those security semantics.
     """
-
-    def do_GET(self):
-        parts = self._parts()
-        if parts != ["api", "health"] and not self._auth():
-            return self._json(401, {"error": "unauthorised"})
-        return super().do_GET()
 
 
 def build_hardened_server(
