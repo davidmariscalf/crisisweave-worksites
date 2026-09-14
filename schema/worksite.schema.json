@@ -17,6 +17,8 @@
     "safety_notes": {"type": "string"},
     "coordinator_instructions": {"type": "string"},
     "area": {"type": "string", "minLength": 1},
+    "location_precision": {"type": "string", "enum": ["exact", "approximate", "area_only"]},
+    "visibility": {"type": "string", "enum": ["operational", "public"]},
     "geometry": {
       "type": "object",
       "required": ["type", "coordinates"],
