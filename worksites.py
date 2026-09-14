@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import sqlite3
@@ -23,10 +24,41 @@ TRANSITIONS = {
     "cancelled": set(),
 }
 LOCKED_IMPORT_STATES = {"assigned", "in_progress", "completed", "cancelled"}
+MAX_REQUEST_BYTES = 100_000
+MAX_NOTE_LENGTH = 1000
+MAX_ID_LENGTH = 128
+MAX_TEXT_LENGTH = 500
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def safe_id(value: Any, field="id") -> str:
+    value = str(value or "").strip()
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+    if not value or len(value) > MAX_ID_LENGTH or any(c not in allowed for c in value):
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def safe_text(value: Any, field: str, maximum=MAX_TEXT_LENGTH, *, required=True) -> str:
+    value = str(value or "").strip()
+    if required and not value:
+        raise ValueError(f"{field} is required")
+    if len(value) > maximum or "\x00" in value:
+        raise ValueError(f"invalid {field}")
+    return value
+
+
+def parse_origin(value: str | None) -> str | None:
+    value = str(value or "").strip().rstrip("/")
+    if not value:
+        return None
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+        raise ValueError("allowed origin must be an exact http(s) origin")
+    return value
 
 
 def validate_worksite(w: dict[str, Any]) -> None:
@@ -34,10 +66,9 @@ def validate_worksite(w: dict[str, Any]) -> None:
     missing = [k for k in required if k not in w]
     if missing:
         raise ValueError("missing required fields: " + ", ".join(missing))
-    if not isinstance(w["id"], str) or not w["id"].strip():
-        raise ValueError("id must be a non-empty string")
-    if not isinstance(w["title"], str) or not w["title"].strip():
-        raise ValueError("title must be a non-empty string")
+
+    safe_id(w["id"], "worksite id")
+    safe_text(w["title"], "title", 300)
     if w["work_type"] not in WORK_TYPES:
         raise ValueError("unsupported work_type")
     if w["state"] not in STATES:
@@ -46,32 +77,41 @@ def validate_worksite(w: dict[str, Any]) -> None:
         raise ValueError("unsupported priority")
     if not isinstance(w["people_needed"], int) or isinstance(w["people_needed"], bool) or not 1 <= w["people_needed"] <= 1000:
         raise ValueError("people_needed must be an integer from 1 to 1000")
+
     for field in ("skills", "hazards"):
-        if not isinstance(w[field], list) or not all(isinstance(x, str) for x in w[field]):
-            raise ValueError(f"{field} must be a list of strings")
-        if len(set(w[field])) != len(w[field]):
+        if not isinstance(w[field], list) or len(w[field]) > 100 or not all(isinstance(x, str) for x in w[field]):
+            raise ValueError(f"{field} must be a list of at most 100 strings")
+        normalized = [safe_text(x, f"{field} item", 120) for x in w[field]]
+        if len(set(normalized)) != len(normalized):
             raise ValueError(f"{field} must not contain duplicates")
-    if not isinstance(w["area"], str) or not w["area"].strip():
-        raise ValueError("area must be a non-empty string")
-    g = w["geometry"]
-    if not isinstance(g, dict) or g.get("type") != "Point":
+
+    safe_text(w["area"], "area", 300)
+    geometry = w["geometry"]
+    if not isinstance(geometry, dict) or geometry.get("type") != "Point":
         raise ValueError("geometry must be a GeoJSON Point")
-    c = g.get("coordinates")
-    if not isinstance(c, list) or len(c) != 2:
+    coordinates = geometry.get("coordinates")
+    if not isinstance(coordinates, list) or len(coordinates) != 2:
         raise ValueError("geometry.coordinates must contain [longitude, latitude]")
     try:
-        lon, lat = float(c[0]), float(c[1])
+        lon, lat = float(coordinates[0]), float(coordinates[1])
     except (TypeError, ValueError):
         raise ValueError("coordinates must be numeric") from None
     if not (-180 <= lon <= 180 and -90 <= lat <= 90):
         raise ValueError("coordinates outside valid bounds")
-    s = w["source"]
-    if not isinstance(s, dict) or s.get("type") not in {"request", "assessment", "partner_import", "synthetic"}:
+
+    source = w["source"]
+    if not isinstance(source, dict) or source.get("type") not in {"request", "assessment", "partner_import", "synthetic"}:
         raise ValueError("source must represent an explicit request, assessment, partner import or synthetic demo")
-    if not str(s.get("name") or "").strip() or not str(s.get("source_id") or "").strip():
-        raise ValueError("source.name and source.source_id are required")
-    if w["state"] == "assigned" and not str(w.get("assigned_team") or "").strip():
-        raise ValueError("assigned state requires assigned_team")
+    safe_text(source.get("name"), "source.name", 200)
+    safe_text(source.get("source_id"), "source.source_id", 200)
+
+    if w["state"] == "assigned":
+        safe_id(w.get("assigned_team"), "assigned_team")
+    elif w.get("assigned_team") not in (None, ""):
+        raise ValueError("assigned_team is only valid in assigned state")
+
+    if "coordinator_instructions" in w:
+        safe_text(w.get("coordinator_instructions"), "coordinator_instructions", 2000, required=False)
 
 
 class WorksiteStore:
@@ -83,9 +123,12 @@ class WorksiteStore:
         con = sqlite3.connect(self.db_path, timeout=10)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=10000")
         return con
 
     def init(self) -> None:
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as con:
             con.executescript("""
             CREATE TABLE IF NOT EXISTS worksites(
@@ -115,23 +158,27 @@ class WorksiteStore:
 
     @staticmethod
     def _decode(row: sqlite3.Row) -> dict[str, Any]:
-        d = json.loads(row["payload"])
-        d.update(
+        data = json.loads(row["payload"])
+        data.update(
             state=row["state"], assigned_team=row["assigned_team"], version=row["version"],
-            created_at=row["created_at"], updated_at=row["updated_at"]
+            created_at=row["created_at"], updated_at=row["updated_at"],
         )
-        return d
+        return data
 
     def _audit(self, con, wid, actor, action, old_state, new_state, note="", details=None):
+        actor = safe_text(actor or "unknown", "actor", 200)
+        note = safe_text(note, "note", MAX_NOTE_LENGTH, required=False)
         con.execute(
             "INSERT INTO audit(worksite_id,at,actor,action,from_state,to_state,note,details) VALUES(?,?,?,?,?,?,?,?)",
-            (wid, now(), actor or "unknown", action, old_state, new_state, note or "", json.dumps(details or {})),
+            (wid, now(), actor, action, old_state, new_state, note, json.dumps(details or {}, ensure_ascii=False)),
         )
 
     def upsert(self, w: dict[str, Any], actor: str = "import") -> dict[str, Any]:
         incoming = dict(w)
         incoming.setdefault("assigned_team", None)
         validate_worksite(incoming)
+        wid = safe_id(incoming["id"], "worksite id")
+        actor = safe_text(actor, "actor", 200)
         created = str(incoming.get("created_at") or now())
         updated = now()
         payload = dict(incoming)
@@ -140,7 +187,7 @@ class WorksiteStore:
 
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
-            prev = con.execute("SELECT state,assigned_team FROM worksites WHERE id=?", (incoming["id"],)).fetchone()
+            prev = con.execute("SELECT state,assigned_team FROM worksites WHERE id=?", (wid,)).fetchone()
             if prev:
                 old_state = prev["state"]
                 locked = old_state in LOCKED_IMPORT_STATES
@@ -148,21 +195,22 @@ class WorksiteStore:
                 assigned_team = prev["assigned_team"] if locked else incoming.get("assigned_team")
                 con.execute(
                     "UPDATE worksites SET payload=?,state=?,assigned_team=?,version=version+1,updated_at=? WHERE id=?",
-                    (json.dumps(payload, ensure_ascii=False), state, assigned_team, updated, incoming["id"]),
+                    (json.dumps(payload, ensure_ascii=False), state, assigned_team, updated, wid),
                 )
                 action = "import_refresh_locked" if locked else "import_update"
                 details = {"incoming_state": incoming["state"], "preserved_state": state} if locked else {}
-                self._audit(con, incoming["id"], actor, action, old_state, state, details=details)
+                self._audit(con, wid, actor, action, old_state, state, details=details)
             else:
                 state = incoming["state"]
                 con.execute(
                     "INSERT INTO worksites(id,payload,state,assigned_team,created_at,updated_at) VALUES(?,?,?,?,?,?)",
-                    (incoming["id"], json.dumps(payload, ensure_ascii=False), state, incoming.get("assigned_team"), created, updated),
+                    (wid, json.dumps(payload, ensure_ascii=False), state, incoming.get("assigned_team"), created, updated),
                 )
-                self._audit(con, incoming["id"], actor, "created", None, state)
-        return self.get(incoming["id"])
+                self._audit(con, wid, actor, "created", None, state)
+        return self.get(wid)
 
     def get(self, wid: str) -> dict[str, Any]:
+        wid = safe_id(wid, "worksite id")
         with self.connect() as con:
             row = con.execute("SELECT * FROM worksites WHERE id=?", (wid,)).fetchone()
         if not row:
@@ -170,6 +218,8 @@ class WorksiteStore:
         return self._decode(row)
 
     def list(self, state: str | None = None) -> list[dict[str, Any]]:
+        if state is not None and state not in STATES:
+            raise ValueError("unsupported state")
         with self.connect() as con:
             if state:
                 rows = con.execute("SELECT * FROM worksites WHERE state=? ORDER BY updated_at DESC", (state,)).fetchall()
@@ -178,6 +228,9 @@ class WorksiteStore:
         return [self._decode(r) for r in rows]
 
     def transition(self, wid: str, target: str, actor: str, note: str = "") -> dict[str, Any]:
+        wid = safe_id(wid, "worksite id")
+        actor = safe_text(actor, "actor", 200)
+        note = safe_text(note, "note", MAX_NOTE_LENGTH, required=False)
         if target not in STATES:
             raise ValueError("unknown target state")
         with self.connect() as con:
@@ -190,13 +243,18 @@ class WorksiteStore:
                 raise ValueError("use assign operation to enter assigned state")
             if target not in TRANSITIONS[current]:
                 raise ValueError(f"invalid transition: {current} -> {target}")
-            con.execute("UPDATE worksites SET state=?,version=version+1,updated_at=? WHERE id=?", (target, now(), wid))
+            assigned_team = None if target in {"completed", "cancelled"} else row["assigned_team"]
+            con.execute(
+                "UPDATE worksites SET state=?,assigned_team=?,version=version+1,updated_at=? WHERE id=?",
+                (target, assigned_team, now(), wid),
+            )
             self._audit(con, wid, actor, "transition", current, target, note)
         return self.get(wid)
 
     def assign(self, wid: str, team_id: str, actor: str) -> dict[str, Any]:
-        if not str(team_id).strip():
-            raise ValueError("team_id is required")
+        wid = safe_id(wid, "worksite id")
+        team_id = safe_id(team_id, "team_id")
+        actor = safe_text(actor, "actor", 200)
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT * FROM worksites WHERE id=?", (wid,)).fetchone()
@@ -214,6 +272,8 @@ class WorksiteStore:
         return self.get(wid)
 
     def release(self, wid: str, actor: str) -> dict[str, Any]:
+        wid = safe_id(wid, "worksite id")
+        actor = safe_text(actor, "actor", 200)
         with self.connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT * FROM worksites WHERE id=?", (wid,)).fetchone()
@@ -222,11 +282,15 @@ class WorksiteStore:
             if row["state"] != "assigned":
                 raise ValueError("only an assigned worksite can be released")
             team = row["assigned_team"]
-            con.execute("UPDATE worksites SET state='ready',assigned_team=NULL,version=version+1,updated_at=? WHERE id=?", (now(), wid))
+            con.execute(
+                "UPDATE worksites SET state='ready',assigned_team=NULL,version=version+1,updated_at=? WHERE id=?",
+                (now(), wid),
+            )
             self._audit(con, wid, actor, "released", "assigned", "ready", details={"team_id": team})
         return self.get(wid)
 
     def audit(self, wid: str) -> list[dict[str, Any]]:
+        wid = safe_id(wid, "worksite id")
         with self.connect() as con:
             rows = con.execute("SELECT * FROM audit WHERE worksite_id=? ORDER BY seq", (wid,)).fetchall()
         return [{**dict(r), "details": json.loads(r["details"])} for r in rows]
@@ -235,35 +299,68 @@ class WorksiteStore:
 class APIHandler(BaseHTTPRequestHandler):
     store: WorksiteStore
     token: str | None = None
+    allowed_origin: str | None = None
+    server_version = "CrisisWeaveWorksites/0.2"
+    sys_version = ""
 
     def log_message(self, fmt, *args):
         return
 
+    def _cors_origin(self) -> str | None:
+        origin = self.headers.get("Origin", "").rstrip("/")
+        return origin if self.allowed_origin and origin == self.allowed_origin else None
+
     def _json(self, status: int, data: Any) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode()
+        body = b"" if status == 204 else json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        cors = self._cors_origin()
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", cors)
+            self.send_header("Vary", "Origin")
         self.end_headers()
-        self.wfile.write(body)
+        if body:
+            self.wfile.write(body)
 
     def do_OPTIONS(self):
-        self._json(204, {})
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if not self.allowed_origin or origin != self.allowed_origin:
+            return self._json(403, {"error": "origin not allowed"})
+        requested = {x.strip().lower() for x in self.headers.get("Access-Control-Request-Headers", "").split(",") if x.strip()}
+        if not requested.issubset({"authorization", "content-type"}):
+            return self._json(403, {"error": "requested headers not allowed"})
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", self.allowed_origin)
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Vary", "Origin")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
 
     def _parts(self) -> list[str]:
         return [p for p in urlparse(self.path).path.split("/") if p]
 
     def _auth(self) -> bool:
-        return not self.token or self.headers.get("Authorization") == f"Bearer {self.token}"
+        if not self.token:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        expected = f"Bearer {self.token}"
+        return hmac.compare_digest(supplied, expected)
 
     def _body(self) -> dict[str, Any]:
-        n = int(self.headers.get("Content-Length") or 0)
-        if n > 100000:
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError as exc:
+            raise ValueError("invalid Content-Length") from exc
+        if length < 0 or length > MAX_REQUEST_BYTES:
             raise ValueError("request body too large")
-        data = json.loads(self.rfile.read(n) if n else b"{}")
+        data = json.loads(self.rfile.read(length) if length else b"{}")
         if not isinstance(data, dict):
             raise ValueError("JSON body must be an object")
         return data
@@ -272,18 +369,18 @@ class APIHandler(BaseHTTPRequestHandler):
         try:
             parts = self._parts()
             if parts == ["api", "health"]:
-                return self._json(200, {"ok": True, "service": "crisisweave-worksites"})
+                return self._json(200, {"ok": True, "service": "crisisweave-worksites", "version": "0.2"})
             if parts == ["api", "worksites"]:
                 return self._json(200, {"worksites": self.store.list()})
             if len(parts) == 3 and parts[:2] == ["api", "worksites"]:
-                return self._json(200, self.store.get(parts[2]))
+                return self._json(200, self.store.get(safe_id(parts[2], "worksite id")))
             if len(parts) == 4 and parts[:2] == ["api", "worksites"] and parts[3] == "audit":
-                return self._json(200, {"audit": self.store.audit(parts[2])})
-            self._json(404, {"error": "not found"})
+                return self._json(200, {"audit": self.store.audit(safe_id(parts[2], "worksite id"))})
+            return self._json(404, {"error": "not found"})
         except KeyError:
-            self._json(404, {"error": "worksite not found"})
-        except Exception as exc:
-            self._json(400, {"error": str(exc)})
+            return self._json(404, {"error": "worksite not found"})
+        except ValueError as exc:
+            return self._json(400, {"error": str(exc)})
 
     def do_POST(self):
         if not self._auth():
@@ -293,26 +390,42 @@ class APIHandler(BaseHTTPRequestHandler):
             data = self._body()
             if len(parts) != 4 or parts[:2] != ["api", "worksites"]:
                 return self._json(404, {"error": "not found"})
-            wid, op = parts[2], parts[3]
-            actor = str(data.get("actor") or "coordinator")
+            wid, op = safe_id(parts[2], "worksite id"), parts[3]
+            actor = safe_text(data.get("actor") or "coordinator", "actor", 200)
             if op == "assign":
-                out = self.store.assign(wid, str(data.get("team_id") or ""), actor)
+                out = self.store.assign(wid, safe_id(data.get("team_id"), "team_id"), actor)
             elif op == "release":
                 out = self.store.release(wid, actor)
             elif op == "transition":
-                out = self.store.transition(wid, str(data.get("state") or ""), actor, str(data.get("note") or ""))
+                note = safe_text(data.get("note"), "note", MAX_NOTE_LENGTH, required=False)
+                out = self.store.transition(wid, str(data.get("state") or ""), actor, note)
             else:
                 return self._json(404, {"error": "not found"})
-            self._json(200, out)
+            return self._json(200, out)
         except KeyError:
-            self._json(404, {"error": "worksite not found"})
-        except Exception as exc:
-            self._json(409, {"error": str(exc)})
+            return self._json(404, {"error": "worksite not found"})
+        except (ValueError, json.JSONDecodeError) as exc:
+            return self._json(409, {"error": str(exc)})
+
+
+def build_server(store: WorksiteStore, host="127.0.0.1", port=8787, token=None, allowed_origin=None):
+    handler = type("BoundAPIHandler", (APIHandler,), {})
+    handler.store = store
+    handler.token = token or None
+    handler.allowed_origin = parse_origin(allowed_origin)
+    return ThreadingHTTPServer((host, port), handler)
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
     with Path(path).open(encoding="utf-8") as handle:
-        return [json.loads(line) for line in handle if line.strip()]
+        rows = []
+        for line in handle:
+            if line.strip():
+                value = json.loads(line)
+                if not isinstance(value, dict):
+                    raise ValueError("JSONL rows must be objects")
+                rows.append(value)
+        return rows
 
 
 def main() -> None:
@@ -327,7 +440,10 @@ def main() -> None:
     transition = sub.add_parser("transition"); transition.add_argument("id"); transition.add_argument("state", choices=STATES); transition.add_argument("--actor", default="cli"); transition.add_argument("--note", default="")
     release = sub.add_parser("release"); release.add_argument("id"); release.add_argument("--actor", default="cli")
     export = sub.add_parser("export"); export.add_argument("--state", choices=STATES)
-    serve = sub.add_parser("serve"); serve.add_argument("--host", default="127.0.0.1"); serve.add_argument("--port", type=int, default=8787)
+    serve = sub.add_parser("serve")
+    serve.add_argument("--host", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=8787)
+    serve.add_argument("--allowed-origin", default=os.getenv("CW_WORKSITES_ALLOWED_ORIGIN") or None)
     args = parser.parse_args()
     store = WorksiteStore(args.db)
 
@@ -355,9 +471,11 @@ def main() -> None:
         for worksite in store.list(args.state):
             print(json.dumps(worksite, ensure_ascii=False))
     elif args.cmd == "serve":
-        APIHandler.store = store
-        APIHandler.token = os.getenv("CW_COORDINATOR_TOKEN") or None
-        server = ThreadingHTTPServer((args.host, args.port), APIHandler)
+        server = build_server(
+            store, args.host, args.port,
+            os.getenv("CW_COORDINATOR_TOKEN") or None,
+            args.allowed_origin,
+        )
         print(f"CrisisWeave worksites API on http://{args.host}:{args.port}")
         server.serve_forever()
 
