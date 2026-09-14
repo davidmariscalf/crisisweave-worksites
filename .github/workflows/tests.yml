@@ -10,5 +10,5 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: python worksites.py validate examples/worksites.jsonl --db /tmp/cw.db
+      - run: python worksites.py --db /tmp/cw.db validate examples/worksites.jsonl
       - run: python -m unittest discover -s tests -v
