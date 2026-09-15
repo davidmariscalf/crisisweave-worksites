@@ -9,7 +9,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     CW_HTTP_SOCKET_TIMEOUT=10
 
 WORKDIR /app
-COPY worksites.py worksites_server.py server_runtime.py audit_guard.py /app/
+COPY worksites.py worksites_server.py server_runtime.py audit_guard.py staleness.py /app/
 
 RUN useradd --create-home --uid 10001 crisisweave \
     && mkdir -p /data \

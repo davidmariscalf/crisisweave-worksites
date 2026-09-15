@@ -12,9 +12,10 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - run: python -m py_compile worksites.py worksites_server.py server_runtime.py public_export.py audit_guard.py
+      - run: python -m py_compile worksites.py worksites_server.py server_runtime.py public_export.py audit_guard.py staleness.py
       - run: python worksites.py --db /tmp/cw.db validate examples/worksites.jsonl
       - run: python -m unittest discover -s tests -v
+      - run: python staleness.py --db /tmp/cw.db | python -c "import json,sys; d=json.load(sys.stdin); assert 'stale_worksites' in d"
       - name: Build container
         run: docker build -t crisisweave-worksites:test .
       - name: Smoke test container
@@ -27,6 +28,7 @@ jobs:
           for i in $(seq 1 30); do
             if python -c "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:18787/api/health',timeout=2); d=json.load(r); assert r.status==200 and d.get('ok')"; then
               docker exec cw-worksites-test python audit_guard.py verify >/dev/null
+              docker exec cw-worksites-test python staleness.py --db /data/worksites.db >/dev/null
               exit 0
             fi
             sleep 1
