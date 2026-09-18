@@ -38,6 +38,15 @@ class StalenessTests(unittest.TestCase):
         self.assertEqual(report["stale_worksites"], 1)
         self.assertEqual(report["items"][0]["id"], "w1")
 
+    def test_naive_times_are_treated_as_utc(self):
+        now = datetime(2026, 1, 2, 12, 0)
+        with self.store.connect() as con:
+            con.execute("UPDATE worksites SET updated_at=? WHERE id='w1'", ("2026-01-01T10:00:00",))
+        report = stale_report(self.store, now_value=now)
+        self.assertEqual(report["stale_worksites"], 1)
+        self.assertEqual(report["items"][0]["age_hours"], 26.0)
+        self.assertTrue(report["generated_at"].endswith("Z"))
+
     def test_terminal_work_is_not_reported(self):
         now = datetime.now(timezone.utc)
         with self.store.connect() as con:
