@@ -18,12 +18,19 @@ DEFAULT_HOURS = {
 
 
 def parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 def stale_report(store: WorksiteStore, thresholds: dict[str, int] | None = None, *, now_value: datetime | None = None) -> dict:
     thresholds = {**DEFAULT_HOURS, **(thresholds or {})}
     current = now_value or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    else:
+        current = current.astimezone(timezone.utc)
     stale = []
     open_count = 0
     for worksite in store.list():
